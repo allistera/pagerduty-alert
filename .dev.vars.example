@@ -1,0 +1,2 @@
+PAGERDUTY_ROUTING_KEY=your-pagerduty-events-v2-integration-key
+CF_WEBHOOK_SECRET=a-long-random-secret-shared-with-cloudflare-webhook-destination

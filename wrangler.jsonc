@@ -1,0 +1,10 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "pagerduty-alert",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-18",
+  "observability": { "enabled": true },
+  "vars": {
+    "PAGERDUTY_EVENTS_URL": "https://events.pagerduty.com/v2/enqueue"
+  }
+}
