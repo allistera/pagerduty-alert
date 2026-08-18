@@ -40,14 +40,30 @@ function severityFor(alert: CloudflareAlertPayload): PagerDutySeverity {
 	return "warning";
 }
 
-function toPagerDutyEvent(alert: CloudflareAlertPayload, routingKey: string) {
+interface PagerDutyEvent {
+	routing_key: string;
+	event_action: "trigger";
+	payload: {
+		summary: string;
+		source: string;
+		severity: PagerDutySeverity;
+		timestamp?: string;
+		component?: string | null;
+		custom_details?: unknown;
+	};
+}
+
+function toPagerDutyEvent(
+	alert: CloudflareAlertPayload,
+	routingKey: string,
+): PagerDutyEvent {
 	const summary = (alert.text ?? alert.name ?? "Cloudflare alert").slice(
 		0,
 		1024,
 	);
 	return {
 		routing_key: routingKey,
-		event_action: "trigger" as const,
+		event_action: "trigger",
 		payload: {
 			summary,
 			source: alert.account_id
@@ -61,16 +77,75 @@ function toPagerDutyEvent(alert: CloudflareAlertPayload, routingKey: string) {
 	};
 }
 
-async function forwardToPagerDuty(
-	alert: CloudflareAlertPayload,
+function toPagerDutyEventFromException(
+	item: TraceItem,
+	exception: TraceException,
+	routingKey: string,
+): PagerDutyEvent {
+	const scriptName = item.scriptName ?? "unknown-worker";
+	return {
+		routing_key: routingKey,
+		event_action: "trigger",
+		payload: {
+			summary: `${scriptName}: ${exception.name}: ${exception.message}`.slice(
+				0,
+				1024,
+			),
+			source: `cloudflare-worker:${scriptName}`,
+			severity: "error",
+			timestamp: new Date(exception.timestamp).toISOString(),
+			component: scriptName,
+			custom_details: {
+				exceptionName: exception.name,
+				exceptionMessage: exception.message,
+				stack: exception.stack,
+				outcome: item.outcome,
+				eventTimestamp: item.eventTimestamp,
+			},
+		},
+	};
+}
+
+async function sendPagerDutyEvent(
+	event: PagerDutyEvent,
 	env: Env,
 ): Promise<Response> {
-	const event = toPagerDutyEvent(alert, env.PAGERDUTY_ROUTING_KEY);
 	return fetch(env.PAGERDUTY_EVENTS_URL, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(event),
 	});
+}
+
+async function forwardToPagerDuty(
+	alert: CloudflareAlertPayload,
+	env: Env,
+): Promise<Response> {
+	const event = toPagerDutyEvent(alert, env.PAGERDUTY_ROUTING_KEY);
+	return sendPagerDutyEvent(event, env);
+}
+
+async function forwardExceptionsToPagerDuty(
+	events: TraceItem[],
+	env: Env,
+): Promise<void> {
+	const sends = events.flatMap((item) =>
+		item.exceptions.map(async (exception) => {
+			const event = toPagerDutyEventFromException(
+				item,
+				exception,
+				env.PAGERDUTY_ROUTING_KEY,
+			);
+			const response = await sendPagerDutyEvent(event, env);
+			if (!response.ok) {
+				const detail = await response.text();
+				console.error(
+					`PagerDuty rejected exception event: ${response.status} ${detail}`,
+				);
+			}
+		}),
+	);
+	await Promise.all(sends);
 }
 
 export default {
@@ -109,5 +184,15 @@ export default {
 		}
 
 		return new Response("Alert forwarded to PagerDuty", { status: 200 });
+	},
+
+	async tail(
+		events: TraceItem[],
+		env: Env,
+		_ctx: ExecutionContext,
+	): Promise<void> {
+		const withExceptions = events.filter((item) => item.exceptions.length > 0);
+		if (withExceptions.length === 0) return;
+		await forwardExceptionsToPagerDuty(withExceptions, env);
 	},
 } satisfies ExportedHandler<Env>;

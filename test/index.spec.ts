@@ -122,3 +122,125 @@ describe("cloudflare alert -> pagerduty worker", () => {
 		expect(response.status).toBe(502);
 	});
 });
+
+function makeTraceItem(overrides: Partial<TraceItem> = {}): TraceItem {
+	return {
+		event: null,
+		eventTimestamp: 1755500000000,
+		logs: [],
+		exceptions: [],
+		diagnosticsChannelEvents: [],
+		scriptName: "other-worker",
+		outcome: "exception",
+		executionModel: "stateless",
+		truncated: false,
+		cpuTime: 0,
+		wallTime: 0,
+		...overrides,
+	};
+}
+
+describe("tail handler -> pagerduty", () => {
+	it("ignores trace items with no exceptions", async () => {
+		const fetchSpy = vi.fn();
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const ctx = createExecutionContext();
+		await worker.tail?.([makeTraceItem()], testEnv, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+
+	it("forwards each exception from other workers to PagerDuty", async () => {
+		const fetchSpy = vi
+			.fn()
+			.mockResolvedValue(new Response("{}", { status: 202 }));
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const item = makeTraceItem({
+			scriptName: "cookie-worker",
+			exceptions: [
+				{
+					name: "TypeError",
+					message: "Cannot read properties of undefined",
+					timestamp: 1755500000000,
+					stack: "TypeError: ...\n  at handler (index.js:1:1)",
+				},
+			],
+		});
+
+		const ctx = createExecutionContext();
+		await worker.tail?.([item], testEnv, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		const [calledUrl, calledInit] = fetchSpy.mock.calls[0];
+		expect(calledUrl).toBe("https://events.pagerduty.com/v2/enqueue");
+		const sentBody = JSON.parse(calledInit.body as string);
+		expect(sentBody.routing_key).toBe("test-routing-key");
+		expect(sentBody.event_action).toBe("trigger");
+		expect(sentBody.payload.summary).toBe(
+			"cookie-worker: TypeError: Cannot read properties of undefined",
+		);
+		expect(sentBody.payload.source).toBe("cloudflare-worker:cookie-worker");
+		expect(sentBody.payload.severity).toBe("error");
+		expect(sentBody.payload.custom_details.exceptionName).toBe("TypeError");
+	});
+
+	it("sends one PagerDuty event per exception across multiple trace items", async () => {
+		const fetchSpy = vi
+			.fn()
+			.mockResolvedValue(new Response("{}", { status: 202 }));
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const items = [
+			makeTraceItem({
+				scriptName: "worker-a",
+				exceptions: [
+					{ name: "Error", message: "boom", timestamp: 1755500000000 },
+				],
+			}),
+			makeTraceItem({
+				scriptName: "worker-b",
+				exceptions: [
+					{ name: "RangeError", message: "oops", timestamp: 1755500001000 },
+					{ name: "Error", message: "again", timestamp: 1755500002000 },
+				],
+			}),
+		];
+
+		const ctx = createExecutionContext();
+		await worker.tail?.(items, testEnv, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(fetchSpy).toHaveBeenCalledTimes(3);
+	});
+
+	it("logs but does not throw when PagerDuty rejects an exception event", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi
+				.fn()
+				.mockResolvedValue(new Response("bad routing key", { status: 400 })),
+		);
+		const consoleErrorSpy = vi
+			.spyOn(console, "error")
+			.mockImplementation(() => {});
+
+		const item = makeTraceItem({
+			exceptions: [
+				{ name: "Error", message: "boom", timestamp: 1755500000000 },
+			],
+		});
+
+		const ctx = createExecutionContext();
+		await expect(worker.tail?.([item], testEnv, ctx)).resolves.toBeUndefined();
+		await waitOnExecutionContext(ctx);
+
+		expect(consoleErrorSpy).toHaveBeenCalledWith(
+			expect.stringContaining("PagerDuty rejected exception event: 400"),
+		);
+		consoleErrorSpy.mockRestore();
+	});
+});
